@@ -26,7 +26,6 @@ class WebSiteDownloader extends AbstractDownloader {
       return this.cookies
     }
     const cookies = await this.__readCookies()
-    log.info("cookies:", cookies)
     if (cookies == null) {
       return null
     }
