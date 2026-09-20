@@ -1,23 +1,32 @@
 import {iaxios} from '../common/axioscf.js'
 import {config} from '../common/config.js'
 import {log} from '../common/log4jscf.js'
-import {sleep, buildHeaders, parseCookies} from '../common/utils.js'
+import {sleep, buildHeaders, parseCookies, addCookie, convertCookiesToString} from '../common/utils.js'
+import {randomUUID} from 'crypto'
 import path from "path";
 import fs from "fs";
 import {exec, spawn} from "child_process";
 import kill from "tree-kill";
 import {CustomError} from '../common/error.js'
+import {getXmSign} from './core/xm-sign.js'
 import os from 'os'
+
+// www 域的 revision 接口已被 dws 风控接管，需要浏览器指纹算出的 xm-sign 才能访问，
+// 命令行侧无法复刻，章节列表与播放地址改走无此校验的客户端接口
+const MOBILE_BASE_URL = 'https://mobile.ximalaya.com'
 
 /**
  * 下载抽象类
  */
 class AbstractDownloader {
-    constructor(deviceType) {
+    constructor(deviceType, playDeviceType) {
         if (this.constructor == AbstractDownloader) {
             throw new Error("抽象类不能被实例化")
         }
         this.deviceType = deviceType
+        // 付费声音接口按这个值决定密文用哪套算法加密，与 cookie 用的 deviceType 不是一回事
+        this.playDeviceType = playDeviceType
+        this.pcDeviceId = randomUUID()
         this.cookiePath = path.join(config.xmd.replace('~', os.homedir()), `${deviceType}-cookies.json`)
         this.qrCodePath = path.join(config.xmd.replace('~', os.homedir()), `${deviceType}-qrcode.png`);
         this.albumId = null
@@ -351,7 +360,7 @@ class AbstractDownloader {
      * @returns {Promise<*>}
      */
     async getTracksList(albumId, pageNum, pageSize) {
-        const url = `${config.baseUrl}/revision/album/v1/getTracksList?albumId=${albumId}&pageNum=${pageNum}&pageSize=${pageSize}`
+        const url = `${MOBILE_BASE_URL}/mobile/v1/album/track?albumId=${albumId}&device=android&isAsc=true&pageId=${pageNum}&pageSize=${pageSize}&source=0`
         const referer = `${config.baseUrl}/album/${albumId}`
         const headers = buildHeaders(referer, await this._getCookies())
         const response = await iaxios.get(url, {headers: headers})
@@ -361,11 +370,19 @@ class AbstractDownloader {
         if (response.data == null) {
             throw new Error('数据为空')
         }
-        if (response.data.ret != 200) {
+        if (response.data.ret == 924) {
+            log.error(`专辑${albumId}在客户端渠道不可用，换个专辑试试`, response.data)
+            throw new CustomError(924, "该专辑已下架或不支持客户端渠道")
+        }
+        if (response.data.ret != 0) {
             log.error("喜马拉雅内部异常", response.data)
             throw new Error("喜马拉雅内部异常")
         }
-        return response.data.data
+        const data = response.data.data
+        return {
+            trackTotalCount: data.totalCount,
+            tracks: data.list.map(track => ({trackId: track.trackId, title: track.title}))
+        }
     }
 
     /**
@@ -375,8 +392,7 @@ class AbstractDownloader {
      * @private
      */
     async _getBaseInfo(trackId) {
-        const trackQualityLevel = 2
-        const url = `${config.baseUrl}/mobile-playpage/track/v3/baseInfo/${Date.now()}?device=${this.deviceType}&trackId=${trackId}&trackQualityLevel=${trackQualityLevel}`
+        const url = `${MOBILE_BASE_URL}/mobile/v1/track/baseInfo/${Date.now()}?device=pc&trackId=${trackId}`
         const referer = `${config.baseUrl}/album/${trackId}`
         const headers = buildHeaders(referer, await this._getCookies())
         const response = await iaxios.get(url, {headers: headers})
@@ -394,10 +410,64 @@ class AbstractDownloader {
             log.error(`${this.deviceType}端喜马拉雅接口内部异常`, response.data)
             throw new Error("喜马拉雅内部异常")
         }
-        return {
-            playUrlList: response.data.trackInfo.playUrlList,
-            trackTitle: response.data.albumInfo.title
+        const info = response.data
+        const playUrl = info.playPathHq || info.downloadUrl || info.playUrl64 || info.playUrl32
+        if (playUrl == null || playUrl == '') {
+            // 付费声音这里只有时长和体积，地址要另走带签名的加密接口
+            return {
+                url: await this._getPaidPlayUrl(trackId),
+                trackTitle: info.title
+            }
         }
+        return {
+            url: playUrl,
+            trackTitle: info.title
+        }
+    }
+
+    /**
+     * 付费声音专用 cookie：登录态 + 客户端设备身份
+     *
+     * 这几个设备 cookie 不能并到 _getCookies，章节列表接口按 device=android 请求，
+     * 带上 win32 的设备标识会被判成参数矛盾直接拒掉
+     * @returns {Promise<string>}
+     */
+    async _getPaidCookies() {
+        const cookies = await this.__readCookies()
+        addCookie(cookies, 'install_id', this.pcDeviceId)
+        addCookie(cookies, '1&_device', `win32&${this.pcDeviceId}&4.0.14`)
+        addCookie(cookies, 'channel', '99&100001')
+        return convertCookiesToString(cookies)
+    }
+
+    /**
+     * 获取付费声音的播放地址
+     * @param trackId
+     * @returns {Promise<string>}
+     */
+    async _getPaidPlayUrl(trackId) {
+        const {xmSign, userAgent} = await getXmSign()
+        const url = `${config.baseUrl}/mobile-playpage/track/v3/baseInfo/${Date.now()}?device=${this.playDeviceType}&trackId=${trackId}&trackQualityLevel=1`
+        const headers = buildHeaders(`${config.baseUrl}/`, await this._getPaidCookies())
+        headers['User-Agent'] = userAgent
+        headers['Origin'] = config.baseUrl
+        headers['xm-sign'] = xmSign
+        const response = await iaxios.get(url, {headers: headers})
+        if (response.status != 200) {
+            throw new Error('网络请求失败')
+        }
+        if (response.data == null) {
+            throw new Error('数据为空')
+        }
+        if (response.data.ret != 0) {
+            log.error(`${this.deviceType}端付费声音接口异常`, response.data)
+            throw new CustomError(999, `${this.deviceType}端被风控或没有该声音的收听权限`)
+        }
+        const playUrlList = response.data.trackInfo.playUrlList
+        if (playUrlList == null || playUrlList.length == 0) {
+            throw new CustomError(403, `没有该声音的收听权限，需要VIP或已购买(trackId:${trackId})`)
+        }
+        return this._decrypt(this._playUrl(playUrlList).encodeText)
     }
 
     /**
@@ -478,9 +548,7 @@ class AbstractDownloader {
         let user = await this._getCurrentUser()
         await this._checkUser(user, true)
         const baseInfo = await this._getBaseInfo(trackId)
-        const e = this._playUrl(baseInfo.playUrlList)
-        const url = this._decrypt(e.encodeText)
-        const data = await this._getAudio(url)
+        const data = await this._getAudio(baseInfo.url)
         return data
     }
 
